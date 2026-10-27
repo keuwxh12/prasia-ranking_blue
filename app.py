@@ -75,7 +75,7 @@ def parse_row_text(text):
         name = ""
     return name, guild, subjugation, level
 
-def crawl_worker(task_chunk, worker_id):
+def crawl_worker(task_chunk):
     options = webdriver.ChromeOptions()
     options.add_argument('--headless')
     options.add_argument('--no-sandbox')
@@ -85,13 +85,13 @@ def crawl_worker(task_chunk, worker_id):
     driver = webdriver.Chrome(options=options)
     results = []
     try:
-        for idx, (world_code, cls_code, server_name, cls_name) in enumerate(task_chunk):
+        for world_code, cls_code, server_name, cls_name in task_chunk:
             target_url = f"https://wp.nexon.com/records/ranking?world={world_code}&class={cls_code}"
             rows = []
             for attempt in range(2):
                 try:
                     driver.get(target_url)
-                    time.sleep(2.2)
+                    time.sleep(2.5) # 로딩 대기 시간 안정화
                     soup = BeautifulSoup(driver.page_source, 'html.parser')
                     rows = soup.select("ul[class*='list'] > li")
                     if not rows:
@@ -128,7 +128,7 @@ def run_crawling_process(status_placeholder):
     except Exception as e:
         return False, f"❌ 구글 시트 연결 실패: {e}"
 
-    status_placeholder.text("2. 멀티스레드 고속 크롤링 시작 (총 245개 페이지)... 잠시만 기다려주세요.")
+    status_placeholder.text("2. 랭킹 데이터 수집 시작 (서버별 분산 처리 중...)")
     start_time = time.time()
 
     all_tasks = []
@@ -138,7 +138,8 @@ def run_crawling_process(status_placeholder):
             cls_name = CLASS_MAP[cls_code]
             all_tasks.append((world_code, cls_code, server_name, cls_name))
 
-    max_workers = 5
+    # 스레드 개수를 3개로 낮춰서 서버 과부하 및 멈춤 현상 방지
+    max_workers = 3
     chunk_size = len(all_tasks) // max_workers + (1 if len(all_tasks) % max_workers != 0 else 0)
     task_chunks = [all_tasks[i:i + chunk_size] for i in range(0, len(all_tasks), chunk_size)]
 
@@ -146,9 +147,12 @@ def run_crawling_process(status_placeholder):
     all_g_rows = []
     seen_names = set()
 
+    completed_count = 0
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = [executor.submit(crawl_worker, chunk, i+1) for i, chunk in enumerate(task_chunks)]
+        futures = {executor.submit(crawl_worker, chunk): chunk for chunk in task_chunks}
         for future in as_completed(futures):
+            completed_count += 1
+            status_placeholder.text(f"⏳ 데이터 수집 중... (진행 그룹 {completed_count}/{max_workers})")
             try:
                 chunk_results = future.result()
                 for data in chunk_results:
@@ -164,7 +168,7 @@ def run_crawling_process(status_placeholder):
     elapsed = end_time - start_time
 
     if all_ae_rows:
-        status_placeholder.text("3. 구글 시트 데이터 초기화 및 덮어쓰는 중...")
+        status_placeholder.text("3. 구글 시트 데이터 초기화 및 업로드 중...")
         try:
             worksheet.batch_clear(["A5:E10000", "G5:G10000"])
         except Exception:
@@ -175,7 +179,7 @@ def run_crawling_process(status_placeholder):
         worksheet.update(values=all_g_rows, range_name=f"G5:G{last_row}")
         return True, f"✅ 업데이트 완료! (소요 시간: {elapsed:.2f}초, 수집 건수: {len(all_ae_rows)}건)"
     else:
-        return False, "⚠️ 수집된 데이터가 0건이어서 시트에 덮어쓰지 않았습니다."
+        return False, "⚠️ 수집된 데이터가 0건입니다. 다시 시도해 주세요."
 
 @st.cache_data(ttl=600)
 def load_ranking_data():
@@ -217,13 +221,12 @@ def load_ranking_data():
 st.title("⚔️ 프라시아 전기 결사원 상세 랭킹 대시보드")
 st.markdown("서버별 정렬 및 직업별 통계를 통해 결사원 상세 데이터를 한눈에 확인하세요.")
 
-# 사이드바 설정 (필터 및 관리 기능)
 st.sidebar.header("🛠️ 관리 및 필터")
 
 with st.sidebar.expander("🔄 랭킹 데이터 갱신하기"):
     status_placeholder = st.empty()
     if st.button("🚀 크롤링 및 시트 갱신 실행", type="primary"):
-        with st.spinner("🔄 크롤링 진행 중... (약 2~3분 소요)"):
+        with st.spinner("🔄 크롤링 진행 중... (약 1~2분 소요)"):
             success, message = run_crawling_process(status_placeholder)
         if success:
             status_placeholder.success(message)
@@ -238,18 +241,14 @@ st.sidebar.subheader("🔍 검색 및 필터")
 df = load_ranking_data()
 
 if not df.empty:
-    # 서버 필터
     servers = ["전체"] + sorted(df["서버"].unique().tolist())
     selected_server = st.sidebar.selectbox("서버 선택", servers)
     
-    # 직업 필터
     classes = ["전체"] + sorted(df["직업"].unique().tolist())
     selected_class = st.sidebar.selectbox("직업 선택", classes)
     
-    # 검색어 입력
     search_keyword = st.sidebar.text_input("닉네임 또는 결사 검색", "")
     
-    # 필터링 적용
     filtered_df = df.copy()
     if selected_server != "전체":
         filtered_df = filtered_df[filtered_df["서버"] == selected_server]
@@ -261,10 +260,8 @@ if not df.empty:
             filtered_df["결사명"].str.contains(search_keyword, na=False)
         ]
 
-    # 기본 정렬: 서버별 오름차순 정렬 적용
     filtered_df = filtered_df.sort_values(by=["서버", "레벨"], ascending=[True, False])
 
-    # 메인 상단 요약 지표
     col1, col2, col3 = st.columns(3)
     col1.metric("조회된 캐릭터 수", f"{len(filtered_df):,}명")
     col2.metric("전체 수집 캐릭터", f"{len(df):,}명")
@@ -272,20 +269,16 @@ if not df.empty:
     
     st.markdown("---")
     
-    # --- 직업별 통계 기능 추가 ---
     st.subheader("📊 직업별 분포 통계")
     if not filtered_df.empty:
         class_counts = filtered_df["직업"].value_counts().reset_index()
         class_counts.columns = ["직업", "인원수"]
-        
-        # 바 차트로 직업별 통계 시각화
         st.bar_chart(class_counts.set_index("직업"))
     else:
         st.info("통계낼 데이터가 없습니다.")
 
     st.markdown("---")
     
-    # --- 상세 랭킹 테이블 출력 ---
     st.subheader("📋 결사원 상세 랭킹 목록 (서버별 정렬)")
     st.dataframe(filtered_df, use_container_width=True, hide_index=True)
 else:
