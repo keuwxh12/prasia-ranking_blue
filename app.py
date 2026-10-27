@@ -2,6 +2,7 @@ import os
 import time
 import re
 import gspread
+import pandas as pd
 import streamlit as st
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from google.oauth2.service_account import Credentials
@@ -9,12 +10,15 @@ from bs4 import BeautifulSoup
 from selenium import webdriver
 
 # --- 1. 페이지 및 설정 초기화 ---
-st.set_page_config(page_title="프라시아 전기 랭킹 크롤러", page_icon="⚔️", layout="centered")
+st.set_page_config(
+    page_title="프라시아 전기 결사원 랭킹 대시보드",
+    page_icon="⚔️",
+    layout="wide"
+)
 
 SPREADSHEET_URL = "https://docs.google.com/spreadsheets/d/1FIN_OHmXrXKDB2BYaJ-mKeRFWo7W2-g0KW_UZzC8zTI/edit"
 TARGET_SHEET_NAME = "결사원 상세 리스트"
 
-# 월드 및 클래스 매핑
 WORLD_MAP = {
     "2-1": "론도1", "2-2": "론도2", "2-3": "론도3", "2-4": "론도4", "2-5": "론도5",
     "3-1": "라인소프1", "3-2": "라인소프2", "3-3": "라인소프3", "3-4": "라인소프4", "3-5": "라인소프5",
@@ -36,11 +40,15 @@ CLASSES = list(CLASS_MAP.keys())
 def get_gspread_client():
     try:
         scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
-        credentials_dict = dict(st.secrets["gcp_service_account"])
-        creds = Credentials.from_service_account_info(credentials_dict, scopes=scopes)
+        if "gcp_service_account" in st.secrets:
+            credentials_dict = dict(st.secrets["gcp_service_account"])
+            creds = Credentials.from_service_account_info(credentials_dict, scopes=scopes)
+        else:
+            BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+            CREDENTIALS_PATH = os.path.join(BASE_DIR, "credentials.json")
+            creds = Credentials.from_service_account_file(CREDENTIALS_PATH, scopes=scopes)
         return gspread.authorize(creds)
-    except Exception as e:
-        st.error(f"구글 시트 인증 에러: {e}")
+    except Exception:
         return None
 
 def parse_row_text(text):
@@ -109,7 +117,7 @@ def crawl_worker(task_chunk, worker_id):
     return results
 
 def run_crawling_process(status_placeholder):
-    status_placeholder.text("1. 구글 서비스 계정 인증 중...")
+    status_placeholder.text("1. 구글 인증 진행 중...")
     gc = get_gspread_client()
     if not gc:
         return False, "❌ 구글 시트 클라이언트 인증 실패"
@@ -169,18 +177,116 @@ def run_crawling_process(status_placeholder):
     else:
         return False, "⚠️ 수집된 데이터가 0건이어서 시트에 덮어쓰지 않았습니다."
 
-# --- 웹 화면 UI ---
-st.title("⚔️ 프라시아 전기 결사원 상세 랭킹 크롤러")
-st.markdown("버튼을 누르면 넥슨 랭킹 데이터를 수집하여 **[결사원 상세 리스트]** 구글 시트에 최신화합니다.")
-st.info(f"대상 구글 시트: [{TARGET_SHEET_NAME}]({SPREADSHEET_URL})")
+@st.cache_data(ttl=600)
+def load_ranking_data():
+    gc = get_gspread_client()
+    if not gc:
+        return pd.DataFrame()
+    try:
+        doc = gc.open_by_url(SPREADSHEET_URL)
+        worksheet = doc.worksheet(TARGET_SHEET_NAME)
+        data_ae = worksheet.get("A5:E10000")
+        data_g = worksheet.get("G5:G10000")
+        
+        if not data_ae:
+            return pd.DataFrame()
+            
+        rows = []
+        for i, row in enumerate(data_ae):
+            server = row[0] if len(row) > 0 else ""
+            guild = row[1] if len(row) > 1 else ""
+            cls = row[2] if len(row) > 2 else ""
+            name = row[3] if len(row) > 3 else ""
+            level = row[4] if len(row) > 4 else ""
+            subjugation = data_g[i][0] if i < len(data_g) and len(data_g[i]) > 0 else ""
+            
+            if name:
+                rows.append({
+                    "서버": server,
+                    "결사명": guild,
+                    "직업": cls,
+                    "닉네임": name,
+                    "레벨": level,
+                    "토벌등급": subjugation
+                })
+        return pd.DataFrame(rows)
+    except Exception:
+        return pd.DataFrame()
 
-status_placeholder = st.empty()
+# --- 웹 대시보드 UI 레이아웃 ---
+st.title("⚔️ 프라시아 전기 결사원 상세 랭킹 대시보드")
+st.markdown("서버별 정렬 및 직업별 통계를 통해 결사원 상세 데이터를 한눈에 확인하세요.")
 
-if st.button("🚀 랭킹 데이터 수집 및 시트 갱신 시작", type="primary"):
-    with st.spinner("🔄 크롤링이 진행 중입니다. 완료될 때까지 창을 닫지 마세요... (약 2~3분 소요)"):
-        success, message = run_crawling_process(status_placeholder)
-    if success:
-        status_placeholder.success(message)
-        st.balloons()
+# 사이드바 설정 (필터 및 관리 기능)
+st.sidebar.header("🛠️ 관리 및 필터")
+
+with st.sidebar.expander("🔄 랭킹 데이터 갱신하기"):
+    status_placeholder = st.empty()
+    if st.button("🚀 크롤링 및 시트 갱신 실행", type="primary"):
+        with st.spinner("🔄 크롤링 진행 중... (약 2~3분 소요)"):
+            success, message = run_crawling_process(status_placeholder)
+        if success:
+            status_placeholder.success(message)
+            st.cache_data.clear()
+            st.rerun()
+        else:
+            status_placeholder.error(message)
+
+st.sidebar.divider()
+st.sidebar.subheader("🔍 검색 및 필터")
+
+df = load_ranking_data()
+
+if not df.empty:
+    # 서버 필터
+    servers = ["전체"] + sorted(df["서버"].unique().tolist())
+    selected_server = st.sidebar.selectbox("서버 선택", servers)
+    
+    # 직업 필터
+    classes = ["전체"] + sorted(df["직업"].unique().tolist())
+    selected_class = st.sidebar.selectbox("직업 선택", classes)
+    
+    # 검색어 입력
+    search_keyword = st.sidebar.text_input("닉네임 또는 결사 검색", "")
+    
+    # 필터링 적용
+    filtered_df = df.copy()
+    if selected_server != "전체":
+        filtered_df = filtered_df[filtered_df["서버"] == selected_server]
+    if selected_class != "전체":
+        filtered_df = filtered_df[filtered_df["직업"] == selected_class]
+    if search_keyword:
+        filtered_df = filtered_df[
+            filtered_df["닉네임"].str.contains(search_keyword, na=False) | 
+            filtered_df["결사명"].str.contains(search_keyword, na=False)
+        ]
+
+    # 기본 정렬: 서버별 오름차순 정렬 적용
+    filtered_df = filtered_df.sort_values(by=["서버", "레벨"], ascending=[True, False])
+
+    # 메인 상단 요약 지표
+    col1, col2, col3 = st.columns(3)
+    col1.metric("조회된 캐릭터 수", f"{len(filtered_df):,}명")
+    col2.metric("전체 수집 캐릭터", f"{len(df):,}명")
+    col3.metric("대상 시트", TARGET_SHEET_NAME)
+    
+    st.markdown("---")
+    
+    # --- 직업별 통계 기능 추가 ---
+    st.subheader("📊 직업별 분포 통계")
+    if not filtered_df.empty:
+        class_counts = filtered_df["직업"].value_counts().reset_index()
+        class_counts.columns = ["직업", "인원수"]
+        
+        # 바 차트로 직업별 통계 시각화
+        st.bar_chart(class_counts.set_index("직업"))
     else:
-        status_placeholder.error(message)
+        st.info("통계낼 데이터가 없습니다.")
+
+    st.markdown("---")
+    
+    # --- 상세 랭킹 테이블 출력 ---
+    st.subheader("📋 결사원 상세 랭킹 목록 (서버별 정렬)")
+    st.dataframe(filtered_df, use_container_width=True, hide_index=True)
+else:
+    st.warning("⚠️ 시트에 데이터가 없거나 불러오지 못했습니다. 사이드바의 **[크롤링 및 시트 갱신 실행]** 버튼을 먼저 눌러주세요.")
