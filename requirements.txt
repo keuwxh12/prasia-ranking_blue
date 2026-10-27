@@ -1,0 +1,5 @@
+streamlit
+gspread
+beautifulsoup4
+selenium
+google-auth
